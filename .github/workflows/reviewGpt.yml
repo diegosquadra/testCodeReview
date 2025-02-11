@@ -1,0 +1,71 @@
+name: Integrate PR Content with ChatGPT
+
+on:
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  interact-with-chatgpt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install jq
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Extract and Prepare PR Content
+        run: |
+          git fetch origin +refs/pull/${{ github.event.pull_request.number }}/merge
+          git checkout FETCH_HEAD
+          files_changed=$(git diff --name-only ${{ github.event.pull_request.base.sha }} HEAD)
+          changes=""
+          for file in $files_changed; do
+            diff=$(git diff ${{ github.event.pull_request.base.sha }} HEAD -- $file)
+            changes+="${file}:\n${diff}\n"
+          done
+          # Encode changes to base64 to ensure safe transmission
+          encoded_changes=$(echo -n "$changes" | base64 -w 0)
+          echo "ENCODED_CHANGES=$encoded_changes" >> $GITHUB_ENV
+
+      - name: Call ChatGPT with PR content
+        run: |
+            # Decode base64 changes to normal text (for debugging or if needed)
+            decoded_changes=$(echo "${{ env.ENCODED_CHANGES }}" | base64 --decode)
+ 
+            # Use jq to create JSON payload safely
+            json_payload=$(jq -n --arg content "$decoded_changes" --arg additionalMessage "Voce é um desenvolvedor senior e esta analisando uma pull request, validando se o codigo tem uma más pratica, caso tenham informe os codigos que tenham as más pratica e uma possivel solução, caso o codigo esteja bom faça apenas considerações" '{
+              model: "gpt-4o-mini",
+              store: true,
+              messages: [
+                {role: "user", content: $additionalMessage},
+                {role: "user", content: $content}
+              ]
+            }')
+ 
+            # Send request to OpenAI API
+            response=$(curl -s https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+            -d "$json_payload")
+
+            # Extract the 'content' field from the response
+            content=$(echo $response | jq -r '.choices[0].message.content')
+
+            # Prepare the JSON body for the GitHub API request, escaping newlines and quotes
+            json_body=$(jq -n --arg body "$content" '{"body": $body}')
+
+            # Post the content as a comment to the pull request
+            curl -s \
+            -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d "$json_body" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments"
